@@ -259,6 +259,12 @@ type resAlbumInfo struct {
 	} `json:"SONGS"`
 }
 
+type resPlaylistInfo struct {
+	Songs struct {
+		Data []resSongInfoData `json:"data"`
+	} `json:"SONGS"`
+}
+
 type resAlbumGenres struct {
 	Data []struct {
 		ID int `json:"id"`
@@ -475,33 +481,6 @@ func getFavorites(userId string, config configuration) (resTracks, error) {
 	return tracks, err
 }
 
-func getSongInfo(id int64, config configuration) (resSongInfo, error) {
-	url := fmt.Sprintf("https://www.deezer.com/de/track/%d", id)
-
-	res, err := makeReq("GET", url, nil, config)
-	if err != nil { return resSongInfo{}, err }
-	defer res.Body.Close()
-
-	if res.StatusCode != 200 {
-		bytes, _ := io.ReadAll(res.Body)
-		log.Println(string(bytes))
-		return resSongInfo{}, fmt.Errorf("got status code %d", res.StatusCode)
-	}
-
-	bytes, _ := io.ReadAll(res.Body)
-	s := string(bytes)
-
-	startMarker := `window.__DZR_APP_STATE__ = `
-	endMarker := `</script>`
-	startIdx := strings.Index(s, startMarker)
-	endIdx := strings.Index(s[startIdx:], endMarker)
-	sData := s[startIdx + len(startMarker):startIdx + endIdx]
-
-	var songInfo resSongInfo
-	err = json.NewDecoder(strings.NewReader(sData)).Decode(&songInfo)
-	return songInfo, err
-}
-
 func getAlbum(albumId string, config configuration) (resAlbum, error) {
 	url := fmt.Sprintf("https://api.deezer.com/album/%s", albumId)
 	res, err := makeReq("GET", url, nil, config)
@@ -606,14 +585,6 @@ func getSongUrl(songUrlData resSongUrl) (string, error) {
 	return sources[0].Url, nil
 }
 
-func getTitle(song resSongInfoData) string {
-	if song.Version != "" {
-		return strings.Join([]string{song.SngTitle, song.Version}, " ")
-	} else {
-		return song.SngTitle
-	}
-}
-
 func getArtist(song resSongInfoData) string {
 	artistNames := make([]string, 0)
 	for _, artist := range song.Artists {
@@ -659,7 +630,7 @@ func getSongPath(song resSongInfoData, album resAlbum, config configuration) str
 	trackNum, err := strconv.Atoi(song.TrackNumber)
 	cleanArtist := SanitizePath(album.Artist.Name)
 	cleanAlbumTitle := SanitizePath(song.AlbTitle)
-	cleanSongTitle := SanitizePath(song.SngTitle)
+	cleanSongTitle := SanitizePath(song.SngTitle + song.Version)
 	if err != nil { panic(err) }
 	return fmt.Sprintf("%s/%s/%s - %s [WEB FLAC]/%02d - %s.flac", config.DestDir,
 		cleanArtist, cleanArtist, cleanAlbumTitle, trackNum, cleanSongTitle)
@@ -829,11 +800,10 @@ func addTags(song resSongInfoData, path string, album resAlbum) error {
 		cmts = flacvorbis.New()
 	}
 
-	title := getTitle(song)
 	artist := getArtist(song)
 	composer := getComposer(song)
 
-	cmts.Add("TITLE", title )
+	cmts.Add("TITLE", song.SngTitle + song.Version)
 	cmts.Add("ALBUM", song.AlbTitle)
 	cmts.Add("ARTIST", artist)
 	cmts.Add("ALBUMARTIST", album.Artist.Name)
@@ -885,7 +855,6 @@ func main() {
 	if err != nil { log.Fatalf("error reading config file: %s\n", err) }
 
 	if command == "album" {
-		album_loop:
 		for idx, albumId := range args {
 			log.Printf("[%03d/%03d] Downloading album %s\n", idx + 1, len(args), albumId)
 			albumInfo, err := getAlbumSongs(albumId, config)
@@ -894,24 +863,30 @@ func main() {
 			album, err := getAlbum(albumId, config)
 			if err != nil { log.Fatalf("error getting album: %s\n", err) }
 
+			song_loop:
 			for _, song := range albumInfo.Songs.Data {
 				songUrlData, err := getSongUrlData(song.TrackToken, config)
-
 				var songUrl string
 				if err == nil {
 					songUrl, err = getSongUrl(songUrlData)
 				}
 
 				if err != nil {
-					msg := fmt.Sprintf("error getting URL for song \"%s\" by %s from \"%s\": %s\n",
-						song.SngTitle, song.ArtName, song.AlbTitle, err)
+					msg := fmt.Sprintf("error getting URL for song \"%s%s\" by %s from \"%s\": %s\n Skipping song.\n",
+						song.SngTitle, song.Version, song.ArtName, song.AlbTitle, err)
 					log.Print(msg)
 					logFile.Write([]byte(msg))
-					log.Print("Album download failed: " + albumId + "\n\n")
-					logFile.Write([]byte("Album download failed: " + albumId + "\n"))
-					continue album_loop
+					continue song_loop
 				}
 				songPath := getSongPath(song, album, config)
+
+				if _, err := os.Stat(songPath); !errors.Is(err, os.ErrNotExist) {
+					msg := fmt.Sprintf("Path \"%s\" already exists: %s\n Skipping song.\n", songPath, err)
+					log.Print(msg)
+					logFile.Write([]byte(msg))
+					continue song_loop
+				}
+
 				songDir := path.Dir(songPath)
 				coverFilePath := songDir + "/cover.jpg"
 

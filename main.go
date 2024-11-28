@@ -622,6 +622,15 @@ func getArtist(song resSongInfoData) string {
 	return fullArtist
 }
 
+func getGenre(album resAlbum) string {
+	genres := make([]string, 0)
+	for _, genre := range album.Genres.Data {
+		genres = append(genres, genre.Name)
+	}	
+	fullGenre := strings.Join(genres, ", ")
+	return fullGenre
+}
+
 func getComposer(song resSongInfoData) string {
 	if song.SngContributors.Composer != nil {
 		composers := make([]string, 0)
@@ -653,16 +662,25 @@ func SanitizePath(rawPath string) string {
 	return cleanPath
 }
 
-// func getSongPath(song resSongInfoData, album resAlbum, config configuration) string {
-func getSongPath(song resSongInfoData, config configuration) string {
+func getSongPath(song resSongInfoData, album resAlbum, config configuration) string {
+	diskNum, err := strconv.Atoi(song.DiskNumber)
 	trackNum, err := strconv.Atoi(song.TrackNumber)
-	// cleanArtist := SanitizePath(album.Artist.Name)
+	cleanAlbumArtist := SanitizePath(album.Artist.Name)
 	cleanArtist := SanitizePath(getArtist(song))
 	cleanAlbumTitle := SanitizePath(song.AlbTitle)
-	cleanSongTitle := SanitizePath(song.SngTitle + song.Version)
+	cleanSongTitle := SanitizePath(song.SngTitle)
+	cleanSongVersion :=  SanitizePath(song.Version)
 	if err != nil { panic(err) }
-	return fmt.Sprintf("%s/%s/%s - %s [WEB FLAC]/%02d - %s.flac", config.DestDir,
-		cleanArtist, cleanArtist, cleanAlbumTitle, trackNum, cleanSongTitle)
+	return fmt.Sprintf(
+		"%s/%s/%s/%02d-%02d %s - %s %s.flac",
+		config.DestDir,
+		cleanAlbumArtist,
+		cleanAlbumTitle,
+		diskNum,
+		trackNum,
+		cleanArtist,
+		cleanSongTitle,
+		cleanSongVersion)
 }
 
 func calcBfKey(songId []byte, config configuration) []byte {
@@ -687,29 +705,12 @@ func blowfishDecrypt(data []byte, key []byte, config configuration) ([]byte, err
 	return res, nil
 }
 
-func ensureSongDirectoryExists(songPath string, coverUrl string) error {
+func ensureSongDirectoryExists(songPath string) error {
 	var err error
 	songDir := path.Dir(songPath)
 	if _, err = os.Stat(songDir); errors.Is(err, os.ErrNotExist) {
 		os.MkdirAll(songDir, os.ModePerm)
-
-		textFilePath := songDir + "/info.txt"
-		textFileData := []byte("Downloaded from Deezer.\n")
-		err = os.WriteFile(textFilePath, textFileData, 0644)
 		if err != nil { return err }
-
-		if len(coverUrl) == 0 {
-			log.Println("Skipping cover")
-		} else {
-			coverFilePath := songDir + "/cover.jpg"
-			f, err := os.Create(coverFilePath)
-			if err != nil { return err }
-			defer f.Close()
-			res, err := http.Get(coverUrl)
-			defer res.Body.Close()
-			_, err = io.Copy(f, res.Body)
-			if err != nil { return err }
-		}
 	}
 	return nil
 }
@@ -800,25 +801,55 @@ func extractFlacComment(f *flac.File) (*flacvorbis.MetaDataBlockVorbisComment, i
 	return cmt, cmtIdx, nil
 }
 
-func addCover(songPath string, coverPath string) error {
-	coverData, err := os.ReadFile(coverPath)
-	if err != nil { return err }
-
+func addCover(songPath string, coverUrl string) error {
+	if len(coverUrl) == 0 {
+		log.Println("Skipping cover")
+		return nil
+	}
+	res, err := http.Get(coverUrl)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	coverData, err := io.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
 	f, err := flac.ParseFile(songPath)
-	if err != nil { return err }
-
+	if err != nil {
+		return err
+	}
 	picture, err := flacpicture.NewFromImageData(flacpicture.PictureTypeFrontCover,
 		"Front cover", coverData, "image/jpeg")
-	if err != nil { return err }
-
+	if err != nil {
+		return err
+	}
 	picturemeta := picture.Marshal()
 	f.Meta = append(f.Meta, &picturemeta)
 	f.Save(songPath)
 	return nil
 }
 
-// func addTags(song resSongInfoData, path string, album resAlbum) error {
-func addTags(song resSongInfoData, path string) error {
+func buildComment(song resSongInfoData, album resAlbum, artist string, composer string, genre string) string {
+	var sb strings.Builder
+	sb.WriteString("Metadata:\n")
+	sb.WriteString(fmt.Sprintf("  Title: %s\n", song.SngTitle))
+	sb.WriteString(fmt.Sprintf("  Version: %s\n", song.Version))
+	sb.WriteString(fmt.Sprintf("  Album: %s\n", song.AlbTitle))
+	sb.WriteString(fmt.Sprintf("  Artist: %s\n", artist))
+	sb.WriteString(fmt.Sprintf("  Album Artist: %s\n", album.Artist.Name))
+	sb.WriteString(fmt.Sprintf("  Composer: %s\n", composer))
+	sb.WriteString(fmt.Sprintf("  Track Number: %s\n", song.TrackNumber))
+	sb.WriteString(fmt.Sprintf("  Disc Number: %s\n", song.DiskNumber))
+	sb.WriteString(fmt.Sprintf("  Copyright: %s\n", song.Copyright))
+	sb.WriteString(fmt.Sprintf("  Date: %s\n", song.PhysicalReleaseDate))
+	sb.WriteString(fmt.Sprintf("  ISRC: %s\n", song.Isrc))
+	sb.WriteString(fmt.Sprintf("  Genre: %s\n", genre))
+	sb.WriteString(fmt.Sprintf("  Label: %s\n", album.Label))
+	return sb.String()
+}
+
+func addTags(song resSongInfoData, path string, album resAlbum) error {
 	var err error
 
 	f, err := flac.ParseFile(path)
@@ -832,17 +863,21 @@ func addTags(song resSongInfoData, path string) error {
 
 	artist := getArtist(song)
 	composer := getComposer(song)
+	genre := getGenre(album)
 
-	cmts.Add("TITLE", song.SngTitle + song.Version)
+	cmts.Add("TITLE", song.SngTitle + " " + song.Version)
 	cmts.Add("ALBUM", song.AlbTitle)
 	cmts.Add("ARTIST", artist)
-	// cmts.Add("ALBUMARTIST", album.Artist.Name)
+	cmts.Add("ALBUMARTIST", album.Artist.Name)
 	cmts.Add("COMPOSER", composer)
 	cmts.Add("TRACKNUMBER", song.TrackNumber)
 	cmts.Add("DISCNUMBER", song.DiskNumber)
 	cmts.Add("COPYRIGHT", song.Copyright)
 	cmts.Add("DATE", song.PhysicalReleaseDate)
 	cmts.Add("ISRC", song.Isrc)
+	cmts.Add("GENRE", genre)
+	cmts.Add("LABEL", album.Label)
+	cmts.Add("COMMENT", buildComment(song, album, artist, composer, genre))
 	cmtsmeta := cmts.Marshal()
 	if idx > 0 {
 		f.Meta[idx] = &cmtsmeta
@@ -889,6 +924,8 @@ func main() {
 			log.Printf("[%03d/%03d] Downloading track %s\n", idx + 1, len(args), trackId)
 			songInfo, err := getSongInfo(trackId, config)
 			song := songInfo.Data
+			album, err := getAlbum(song.AlbId, config)
+			if err != nil { log.Fatalf("error getting album: %s\n", err) }
 			songUrlData, err := getSongUrlData(song.TrackToken, config)
 			var songUrl string
 			if err == nil {
@@ -902,7 +939,7 @@ func main() {
 				logFile.Write([]byte(msg))
 				return
 			}
-			songPath := getSongPath(song, config)
+			songPath := getSongPath(song, album, config)
 
 			if _, err := os.Stat(songPath); !errors.Is(err, os.ErrNotExist) {
 				msg := fmt.Sprintf("Path \"%s\" already exists: %s\n Skipping song.\n", songPath, err)
@@ -911,17 +948,13 @@ func main() {
 				return
 			}
 
-			songDir := path.Dir(songPath)
-			coverFilePath := songDir + "/cover.jpg"
-
-			err = ensureSongDirectoryExists(songPath, "")
+			err = ensureSongDirectoryExists(songPath)
 			if err != nil { log.Fatalf("error preparing directory for song: %s\n", err) }
 			err = downloadSong(songUrl, songPath, song.SngId, 0, config)
 			if err != nil { log.Fatalf("error downloading song: %s\n", err) }
-
-			err = addTags(song, songPath)
+			err = addTags(song, songPath, album)
 			if err != nil { log.Fatalf("error adding tags to song: %s\n", err) }
-			err = addCover(songPath, coverFilePath)
+			err = addCover(songPath, album.CoverXl)
 			if err != nil { log.Fatalf("error adding cover image to song: %s\n", err) }
 		}
 	} else {

@@ -706,11 +706,11 @@ func blowfishDecrypt(data []byte, key []byte, config configuration) ([]byte, err
 }
 
 func ensureSongDirectoryExists(songPath string) error {
-	var err error
 	songDir := path.Dir(songPath)
-	if _, err = os.Stat(songDir); errors.Is(err, os.ErrNotExist) {
-		os.MkdirAll(songDir, os.ModePerm)
-		if err != nil { return err }
+	if _, err := os.Stat(songDir); errors.Is(err, os.ErrNotExist) {
+		if mkErr := os.MkdirAll(songDir, os.ModePerm); mkErr != nil {
+			return mkErr
+		}
 	}
 	return nil
 }

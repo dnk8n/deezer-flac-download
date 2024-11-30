@@ -668,11 +668,10 @@ func getSongPath(song resSongInfoData, album resAlbum, config configuration) str
 	cleanAlbumArtist := SanitizePath(album.Artist.Name)
 	cleanArtist := SanitizePath(getArtist(song))
 	cleanAlbumTitle := SanitizePath(song.AlbTitle)
-	cleanSongTitle := SanitizePath(song.SngTitle)
-	cleanSongVersion :=  SanitizePath(song.Version)
+	cleanSongTitle := SanitizePath(getTitle(song))
 	if err != nil { panic(err) }
 	return fmt.Sprintf(
-		"%s/%s/%s/%02d-%02d %s - %s %s.flac",
+		"%s/%s/%s/%02d%02d %s - %s.flac",
 		config.DestDir,
 		cleanAlbumArtist,
 		cleanAlbumTitle,
@@ -680,7 +679,7 @@ func getSongPath(song resSongInfoData, album resAlbum, config configuration) str
 		trackNum,
 		cleanArtist,
 		cleanSongTitle,
-		cleanSongVersion)
+	)
 }
 
 func calcBfKey(songId []byte, config configuration) []byte {
@@ -849,6 +848,14 @@ func buildComment(song resSongInfoData, album resAlbum, artist string, composer 
 	return sb.String()
 }
 
+func getTitle(song resSongInfoData) string {
+	if song.Version != "" {
+		return strings.Join([]string{song.SngTitle, song.Version}, " ")
+	} else {
+		return song.SngTitle
+	}
+}
+
 func addTags(song resSongInfoData, path string, album resAlbum) error {
 	var err error
 
@@ -865,7 +872,7 @@ func addTags(song resSongInfoData, path string, album resAlbum) error {
 	composer := getComposer(song)
 	genre := getGenre(album)
 
-	cmts.Add("TITLE", song.SngTitle + " " + song.Version)
+	cmts.Add("TITLE", getTitle(song))
 	cmts.Add("ALBUM", song.AlbTitle)
 	cmts.Add("ARTIST", artist)
 	cmts.Add("ALBUMARTIST", album.Artist.Name)
@@ -913,13 +920,18 @@ func main() {
 
 	logFilePath := os.TempDir() + "/deezer-flac-download.log"
 	logFile, err := os.Create(logFilePath)
-	if err != nil { log.Fatalf("error creating log file %s: %s\n", logFilePath, err) }
+	if err != nil {
+		log.Fatalf("error creating log file %s: %s\n", logFilePath, err)
+	} else {
+		log.Println("Created log file %s\n", logFilePath)
+	}
 	defer logFile.Close()
 
 	config, err := getConfig()
 	if err != nil { log.Fatalf("error reading config file: %s\n", err) }
 
 	if command == "track" {
+		track_loop:
 		for idx, trackId := range args {
 			log.Printf("[%03d/%03d] Downloading track %s\n", idx + 1, len(args), trackId)
 			songInfo, err := getSongInfo(trackId, config)
@@ -937,7 +949,7 @@ func main() {
 					song.SngTitle, song.Version, song.ArtName, song.AlbTitle, err)
 				log.Print(msg)
 				logFile.Write([]byte(msg))
-				return
+				continue track_loop
 			}
 			songPath := getSongPath(song, album, config)
 
@@ -945,7 +957,7 @@ func main() {
 				msg := fmt.Sprintf("Path \"%s\" already exists: %s\n Skipping song.\n", songPath, err)
 				log.Print(msg)
 				logFile.Write([]byte(msg))
-				return
+				continue track_loop
 			}
 
 			err = ensureSongDirectoryExists(songPath)

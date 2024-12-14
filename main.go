@@ -501,7 +501,7 @@ func getAlbum(albumId string, config configuration) (resAlbum, error) {
 }
 
 func getAlbumSongs(albumId string, config configuration) (resAlbumInfo, error) {
-	url := fmt.Sprintf("https://www.deezer.com/de/album/%s", albumId)
+	url := fmt.Sprintf("https://www.deezer.com/en/album/%s", albumId)
 
 	res, err := makeReq("GET", url, nil, config)
 	if err != nil { return resAlbumInfo{}, err }
@@ -529,7 +529,7 @@ func getAlbumSongs(albumId string, config configuration) (resAlbumInfo, error) {
 }
 
 func getSongInfo(id string, config configuration) (resSongInfo, error) {
-	url := fmt.Sprintf("https://www.deezer.com/de/track/%s", id)
+	url := fmt.Sprintf("https://www.deezer.com/en/track/%s", id)
 
 	res, err := makeReq("GET", url, nil, config)
 	if err != nil { return resSongInfo{}, err }

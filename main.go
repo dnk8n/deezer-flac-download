@@ -929,6 +929,15 @@ func main() {
 
 	config, err := getConfig()
 	if err != nil { log.Fatalf("error reading config file: %s\n", err) }
+	playlistFilePath := config.DestDir + "/playlist.m3u"
+	playlistFile, err := os.Create(playlistFilePath)
+	if err != nil {
+		log.Fatalf("error creating playlist file %s: %s\n", playlistFilePath, err)
+	} else {
+		log.Println("Created playlist file %s\n", playlistFilePath)
+	}
+	defer playlistFile.Close()
+	playlistFile.Write([]byte("#EXTM3U\n"))
 
 	if command == "track" {
 		track_loop:
@@ -957,6 +966,7 @@ func main() {
 				msg := fmt.Sprintf("Path \"%s\" already exists: %s\n Skipping song.\n", songPath, err)
 				log.Print(msg)
 				logFile.Write([]byte(msg))
+				playlistFile.Write([]byte(songPath + "\n"))
 				continue track_loop
 			}
 
@@ -968,6 +978,7 @@ func main() {
 			if err != nil { log.Fatalf("error adding tags to song: %s\n", err) }
 			err = addCover(songPath, album.CoverXl)
 			if err != nil { log.Fatalf("error adding cover image to song: %s\n", err) }
+			playlistFile.Write([]byte(songPath + "\n"))
 		}
 	} else {
 		printUsage()

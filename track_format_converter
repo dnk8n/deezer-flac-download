@@ -35,6 +35,10 @@ Examples:
 EOF
 }
 
+relpath() {
+    python3 -c "import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$1" "$2"
+}
+
 # Function to clean filename (remove numeric prefixes)
 clean_filename() {
     local filename="$1"
@@ -51,10 +55,10 @@ convert_file() {
     # Get relative path from source base directory
     local relative_path=""
     if [[ -n "$SOURCE_DIR" ]]; then
-        relative_path=$(realpath --relative-to="$SOURCE_DIR" "$source_file")
+        relative_path=$(relpath "$source_file" "$SOURCE_DIR")
     else # M3U case - use relative path from M3U directory
         local m3u_dir=$(dirname "$SOURCE_M3U")
-        relative_path=$(realpath --relative-to="$m3u_dir" "$source_file")
+        relative_path=$(relpath "$source_file" "$m3u_dir")
     fi
     
     # Determine output directory and filename
@@ -102,10 +106,10 @@ move_source_file() {
     # Get relative path for maintaining directory structure
     local relative_path=""
     if [[ -n "$SOURCE_DIR" ]]; then
-        relative_path=$(realpath --relative-to="$SOURCE_DIR" "$source_file")
+        relative_path=$(relpath "$source_file" "$SOURCE_DIR")
     else
         local m3u_dir=$(dirname "$SOURCE_M3U")
-        relative_path=$(realpath --relative-to="$m3u_dir" "$source_file")
+        relative_path=$(relpath "$source_file" "$m3u_dir")
     fi
     
     local deleted_file="$deleted_base/$relative_path"

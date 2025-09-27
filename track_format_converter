@@ -1,0 +1,274 @@
+#!/bin/bash
+set -euo pipefail
+
+# Script: track_format_converter
+# Description: Convert audio files to supported formats with flexible source options
+# Usage: ./track_format_converter [OPTIONS]
+
+# Default values
+CONVERT_TO=""
+SOURCE_DIR=""
+SOURCE_M3U=""
+OUTPUT_PREFIX_DIR=""
+CLEAR_SRC=false
+DATE_SUFFIX=$(date -Iseconds)
+
+# Function to display usage
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Required options:
+  --convert-to FORMAT       Convert to 'mp3' or 'aiff'
+  --source-dir DIR          Source directory (walk all files recursively)
+  --source-m3u FILE         Source M3U playlist file
+  --output-prefix-dir DIR   Output prefix directory (empty for alongside source)
+
+Other options:
+  --clear-src               Move source files to /tmp/deleted after conversion
+
+Note: --source-dir and --source-m3u are mutually exclusive.
+
+Examples:
+  $0 --convert-to mp3 --source-dir /music/flac --output-prefix-dir /music/converted
+  $0 --convert-to aiff --source-m3u playlist.m3u --output-prefix-dir "" --clear-src
+EOF
+}
+
+# Function to clean filename (remove numeric prefixes)
+clean_filename() {
+    local filename="$1"
+    local basename=$(basename "$filename" .flac)
+    echo "$basename" | sed -E 's/^[0-9]+[[:space:]]*//'
+}
+
+# Function to convert a single file
+convert_file() {
+    local source_file="$1"
+    local output_prefix="$2"
+    local convert_format="$3"
+    
+    # Get relative path from source base directory
+    local relative_path=""
+    if [[ -n "$SOURCE_DIR" ]]; then
+        relative_path=$(realpath --relative-to="$SOURCE_DIR" "$source_file")
+    else # M3U case - use relative path from M3U directory
+        local m3u_dir=$(dirname "$SOURCE_M3U")
+        relative_path=$(realpath --relative-to="$m3u_dir" "$source_file")
+    fi
+    
+    # Determine output directory and filename
+    local output_file=""
+    if [[ -z "$output_prefix" ]]; then
+        # Output alongside source file
+        output_file=$(dirname "$source_file")/$(clean_filename "$source_file").$convert_format
+    else
+        # Output to prefix directory with same relative path
+        output_file="$output_prefix/${relative_path%.*}.$convert_format"
+    fi
+    
+    # Create output directory if it doesn't exist
+    local output_dir=$(dirname "$output_file")
+    mkdir -p "$output_dir"
+    
+    echo "Converting: $source_file"
+    echo "Output: $output_file"
+    
+    # Perform conversion based on format
+    case "$convert_format" in
+        aiff)
+            ffmpeg -nostdin -i "$source_file" -write_id3v2 1 -c:v copy -acodec pcm_s16le -ar 44100 -ac 2 -map_metadata 0 -id3v2_version 3 "$output_file" >> "/tmp/ffmpeg-aiff-${DATE_SUFFIX}.log" 2>&1
+            ;;
+        mp3)
+            ffmpeg -nostdin -i "$source_file" -c:v copy -acodec libmp3lame -ab 320k -ar 44100 -ac 2 -map_metadata 0 -id3v2_version 3 -write_id3v1 1 "$output_file" >> "/tmp/ffmpeg-mp3-${DATE_SUFFIX}.log" 2>&1
+            ;;
+    esac
+    
+    # Check if conversion was successful
+    if [[ -s "$output_file" ]]; then
+        echo "✓ Successfully converted: $(basename "$source_file")"
+        return 0
+    else
+        echo "✗ Failed to convert: $(basename "$source_file")"
+        return 1
+    fi
+}
+
+# Function to move source file after successful conversion
+move_source_file() {
+    local source_file="$1"
+    local deleted_base="/tmp/deleted/$DATE_SUFFIX"
+    
+    # Get relative path for maintaining directory structure
+    local relative_path=""
+    if [[ -n "$SOURCE_DIR" ]]; then
+        relative_path=$(realpath --relative-to="$SOURCE_DIR" "$source_file")
+    else
+        local m3u_dir=$(dirname "$SOURCE_M3U")
+        relative_path=$(realpath --relative-to="$m3u_dir" "$source_file")
+    fi
+    
+    local deleted_file="$deleted_base/$relative_path"
+    local deleted_dir=$(dirname "$deleted_file")
+    
+    mkdir -p "$deleted_dir"
+    mv "$source_file" "$deleted_file"
+    echo "Moved source file to: $deleted_file"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --convert-to)
+            CONVERT_TO="$2"
+            shift 2
+            ;;
+        --source-dir)
+            SOURCE_DIR="$2"
+            shift 2
+            ;;
+        --source-m3u)
+            SOURCE_M3U="$2"
+            shift 2
+            ;;
+        --output-prefix-dir)
+            OUTPUT_PREFIX_DIR="$2"
+            shift 2
+            ;;
+        --clear-src)
+            CLEAR_SRC=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Validate required arguments
+if [[ -z "$CONVERT_TO" ]]; then
+    echo "Error: --convert-to is required"
+    usage
+    exit 1
+fi
+
+if [[ "$CONVERT_TO" != "mp3" && "$CONVERT_TO" != "aiff" ]]; then
+    echo "Error: --convert-to must be 'mp3' or 'aiff'"
+    exit 1
+fi
+
+if [[ -z "$SOURCE_DIR" && -z "$SOURCE_M3U" ]]; then
+    echo "Error: Either --source-dir or --source-m3u is required"
+    usage
+    exit 1
+fi
+
+if [[ -n "$SOURCE_DIR" && -n "$SOURCE_M3U" ]]; then
+    echo "Error: --source-dir and --source-m3u are mutually exclusive"
+    usage
+    exit 1
+fi
+
+if [[ -z "$OUTPUT_PREFIX_DIR" ]]; then
+    echo "Output prefix directory is empty - files will be placed alongside source files"
+else
+    mkdir -p "$OUTPUT_PREFIX_DIR"
+    echo "Output prefix directory: $OUTPUT_PREFIX_DIR"
+fi
+
+# Validate source
+if [[ -n "$SOURCE_DIR" ]]; then
+    if [[ ! -d "$SOURCE_DIR" ]]; then
+        echo "Error: Source directory '$SOURCE_DIR' not found!"
+        exit 1
+    fi
+    echo "Source directory: $SOURCE_DIR"
+else
+    if [[ ! -f "$SOURCE_M3U" ]]; then
+        echo "Error: M3U playlist '$SOURCE_M3U' not found!"
+        exit 1
+    fi
+    echo "Source M3U: $SOURCE_M3U"
+fi
+
+echo "Convert to: $CONVERT_TO"
+echo ""
+
+# Setup deleted directory if clear-src is enabled
+if [[ "$CLEAR_SRC" == true ]]; then
+    DELETED_BASE="/tmp/deleted/$DATE_SUFFIX"
+    mkdir -p "$DELETED_BASE"
+    echo "Source files will be moved to: $DELETED_BASE"
+fi
+
+# Process files
+CONVERSION_ERRORS=0
+PROCESSED_COUNT=0
+
+if [[ -n "$SOURCE_DIR" ]]; then
+    # Process directory - find all FLAC files recursively
+    echo "Walking directory: $SOURCE_DIR"
+    while IFS= read -r -d '' file; do
+        if convert_file "$file" "$OUTPUT_PREFIX_DIR" "$CONVERT_TO"; then
+            PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+            if [[ "$CLEAR_SRC" == true ]]; then
+                move_source_file "$file"
+            fi
+        else
+            CONVERSION_ERRORS=$((CONVERSION_ERRORS + 1))
+        fi
+        echo ""
+    done < <(find "$SOURCE_DIR" -type f -name "*.flac" -print0)
+else
+    # Process M3U file
+    echo "Processing M3U playlist: $SOURCE_M3U"
+    M3U_DIR=$(dirname "$SOURCE_M3U")
+    
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        if [[ "$line" =~ ^# ]] || [[ -z "$line" ]]; then
+            continue
+        fi
+        
+        # Resolve file path (handle relative paths in M3U)
+        local source_file="$line"
+        if [[ ! "$source_file" =~ ^/ ]]; then
+            source_file="$M3U_DIR/$line"
+        fi
+        
+        if [[ ! -f "$source_file" ]]; then
+            echo "Warning: File not found: $source_file"
+            continue
+        fi
+        
+        if convert_file "$source_file" "$OUTPUT_PREFIX_DIR" "$CONVERT_TO"; then
+            PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+            if [[ "$CLEAR_SRC" == true ]]; then
+                move_source_file "$source_file"
+            fi
+        else
+            CONVERSION_ERRORS=$((CONVERSION_ERRORS + 1))
+        fi
+        echo ""
+    done < "$SOURCE_M3U"
+fi
+
+# Summary
+echo "Conversion complete!"
+echo "Processed $PROCESSED_COUNT files successfully."
+
+if [[ $CONVERSION_ERRORS -gt 0 ]]; then
+    echo "There were $CONVERSION_ERRORS conversion errors."
+else
+    echo "All files were converted successfully."
+fi
+
+if [[ "$CLEAR_SRC" == true ]]; then
+    echo "Source files moved to: /tmp/deleted/$DATE_SUFFIX"
+fi

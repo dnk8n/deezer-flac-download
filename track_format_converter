@@ -11,6 +11,10 @@ SOURCE_DIR=""
 SOURCE_M3U=""
 OUTPUT_PREFIX_DIR=""
 CLEAR_SRC=false
+UNICODE_SIMPLIFY=true
+COPY_ALREADY_CONVERTED=true
+ORG_BY_ALBUM_ARTIST=true
+ORG_FLAG_PASSED=false
 DATE_SUFFIX=$(date -Iseconds)
 
 # Function to display usage
@@ -26,8 +30,51 @@ Required options:
 
 Other options:
   --clear-src               Move source files to /tmp/deleted after conversion
+  --no-unicode-simplify     Keep special characters in destination names.
+                            By default accented and typographic characters are
+                            transliterated to ASCII (Glücklich -> Glucklich,
+                            Hit 'Em -> Hit 'Em). Only names the script creates
+                            are affected; existing source paths are untouched.
+  --no-org-by-album-artist  Keep the source folder structure in the output.
+                            Requires --output-prefix-dir; without one the
+                            option is rejected. By default, when a prefix dir
+                            is given, output is laid out from each track's own
+                            tags as:
+                              {Band}/{Album}/{Artist} - {Title}.FORMAT
+                            Band is the album artist, falling back to the
+                            artist. A missing album becomes 'Unknown Album',
+                            and a missing title falls back to the filename.
+                            A track with no artist tag at all keeps its source
+                            layout instead, and is reported.
+  --no-copy-already-converted
+                            Ignore source files that are already in the target
+                            format. By default they are included in the
+                            playlist, and copied into --output-prefix-dir when
+                            one is given (without a prefix dir they are already
+                            in place). --clear-src moves their sources too, the
+                            same as it does for converted files.
 
 Note: --source-dir and --source-m3u are mutually exclusive.
+
+In directory mode a playlist of every destination-format track is written to
+<dir-name>.<format>.m3u at the root of the output prefix dir, or of the source
+dir when no prefix is given. It lists files already in that format alongside
+the ones just converted.
+
+In M3U mode a playlist pointing at the converted files is also written:
+  - default: <name>.<format>.m3u alongside the source M3U
+  - with --output-prefix-dir: <name>.<format>.m3u in that directory
+  - with --clear-src: the source M3U is updated in place (a copy of the
+    original is kept in /tmp/deleted/<timestamp>)
+Entries whose source is gone but whose conversion already exists resolve to
+the existing file; entries that are missing or fail keep their original line.
+
+A destination playlist is never clobbered. If one is already there its lines
+are kept as they are and only tracks it does not yet reference are appended,
+so repeat runs accumulate rather than overwrite. The exception is --clear-src
+in M3U mode, which by definition rewrites the source playlist in place - its
+new contents are a transformation of its old ones, and the original is kept
+in /tmp/deleted/<timestamp>.
 
 Examples:
   $0 --convert-to mp3 --source-dir /music/flac --output-prefix-dir /music/converted
@@ -39,6 +86,240 @@ relpath() {
     python3 -c "import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$1" "$2"
 }
 
+abspath() {
+    python3 -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$1"
+}
+
+# Transliterate a path to ASCII, one component at a time so separators and
+# any unmappable component are preserved. Characters that decompose lose their
+# accents; typographic punctuation maps to its ASCII equivalent; anything left
+# that cannot be represented is dropped.
+PY_COMMON=$(cat <<'PYCOMMON'
+import sys, unicodedata
+
+TRANS = {
+    0x2018: "'", 0x2019: "'", 0x201A: "'", 0x201B: "'", 0x2032: "'",
+    0x201C: '"', 0x201D: '"', 0x201E: '"', 0x201F: '"', 0x2033: '"',
+    0x2010: '-', 0x2011: '-', 0x2012: '-', 0x2013: '-', 0x2014: '-',
+    0x2015: '-', 0x2212: '-', 0x2022: '-', 0x00B7: '-',
+    0x2026: '...', 0x00D7: 'x',
+    0x00F8: 'o', 0x00D8: 'O', 0x00E6: 'ae', 0x00C6: 'AE',
+    0x0153: 'oe', 0x0152: 'OE', 0x00DF: 'ss',
+    0x0111: 'd', 0x0110: 'D', 0x0142: 'l', 0x0141: 'L',
+    0x00FE: 'th', 0x00DE: 'Th', 0x00F0: 'd', 0x00D0: 'D',
+    0x2116: 'No', 0x00A9: '(c)', 0x00AE: '(r)', 0x2122: '(tm)',
+}
+
+
+def basic_clean(s):
+    s = ''.join(c if c.isprintable() else ' ' for c in s)
+    # A separator inside a single component would silently create a directory
+    s = s.replace('/', '-')
+    s = ' '.join(s.split())
+    return s.strip(' .')
+
+
+def simplify(part):
+    s = part.translate(TRANS)
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(c for c in s if not unicodedata.combining(c))
+    # NFKD expands vulgar fractions using U+2044, which would otherwise be
+    # dropped and run the numerals together (1/2 -> 12)
+    s = s.replace('⁄', '-')
+    s = s.encode('ascii', 'ignore').decode('ascii')
+    return basic_clean(s)
+
+
+def component(value, do_simplify, limit=180):
+    s = simplify(value) if do_simplify else basic_clean(value)
+    if len(s) > limit:
+        s = s[:limit].rstrip(' .')
+    return s
+PYCOMMON
+)
+
+SIMPLIFY_MAIN=$(cat <<'PYSIMPLIFY'
+out = []
+for part in sys.argv[1].split('/'):
+    simplified = simplify(part)
+    out.append(simplified if simplified else part)
+print('/'.join(out))
+PYSIMPLIFY
+)
+
+# Build {Band}/{Album}/{Artist} - {Title} from a track's own tags, reading
+# ffprobe JSON on stdin. Tag case varies between files, so lookups are folded
+# to lowercase. Prints nothing when there is nothing usable to organise by,
+# which tells the caller to keep the source layout for that file.
+ORG_MAIN=$(cat <<'PYORG'
+import json
+
+do_simplify = sys.argv[1] == 'true'
+fallback_title = sys.argv[2]
+
+raw = json.load(sys.stdin).get('format', {}).get('tags') or {}
+tags = {k.lower(): (v or '').strip() for k, v in raw.items()}
+
+
+def tag(*names):
+    for name in names:
+        if tags.get(name):
+            return tags[name]
+    return ''
+
+
+band = tag('album_artist', 'albumartist', 'band')
+artist = tag('artist')
+album = tag('album')
+title = tag('title')
+
+# An artist of some kind is the minimum needed to organise by. Without one
+# the source folders almost certainly say more than 'Unknown Artist' would,
+# so the caller is told to keep them.
+if not band and not artist:
+    print('')
+    sys.exit(0)
+
+band = component(band or artist, do_simplify, 120)
+album = component(album, do_simplify, 120) or 'Unknown Album'
+artist = component(artist or band, do_simplify, 120) or band
+title = component(title, do_simplify, 120) or component(fallback_title, do_simplify, 120)
+
+name = component('%s - %s' % (artist, title) if title else artist, do_simplify)
+print('%s/%s/%s' % (band, album, name))
+PYORG
+)
+
+SIMPLIFY_SCRIPT="$PY_COMMON"$'\n'"$SIMPLIFY_MAIN"
+ORG_SCRIPT="$PY_COMMON"$'\n'"$ORG_MAIN"
+
+simplify_path() {
+    if [[ "$UNICODE_SIMPLIFY" == true ]]; then
+        python3 -c "$SIMPLIFY_SCRIPT" "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# Relative path (no extension) built from the track's tags, or empty when the
+# tags cannot support it
+org_relpath_for() {
+    ffprobe -v quiet -print_format json -show_entries format_tags "$1" 2>/dev/null |
+        python3 -c "$ORG_SCRIPT" "$UNICODE_SIMPLIFY" "$(clean_filename "$1")"
+}
+
+# Merge tracks into a destination playlist. An existing playlist is never
+# discarded: its lines are kept verbatim, in order, and only tracks it does
+# not already reference are appended. Entries are compared by resolved path,
+# so the same track written relative and absolute counts once. Writes via a
+# temp file so an interrupted run cannot truncate the playlist.
+MERGE_PY=$(cat <<'MERGEPY'
+import os, sys
+
+playlist = sys.argv[1]
+mode = sys.argv[2]
+pdir = os.path.dirname(os.path.abspath(playlist)) or '.'
+
+
+def key(entry, base):
+    path = entry if os.path.isabs(entry) else os.path.join(base, entry)
+    return os.path.realpath(path)
+
+
+def read_lines(path):
+    with open(path, 'r', encoding='utf-8', errors='surrogateescape') as fh:
+        return fh.read().splitlines()
+
+
+out, seen = [], set()
+if os.path.isfile(playlist):
+    out = read_lines(playlist)
+    for line in out:
+        text = line.strip()
+        if text and not text.startswith('#'):
+            seen.add(key(text, pdir))
+if not out or not out[0].strip().startswith('#EXTM3U'):
+    out.insert(0, '#EXTM3U')
+
+added = 0
+if mode == 'paths':
+    # NUL-separated absolute paths on stdin
+    for raw in sys.stdin.buffer.read().split(b'\0'):
+        if not raw:
+            continue
+        track = os.fsdecode(raw)
+        if key(track, pdir) in seen:
+            continue
+        seen.add(key(track, pdir))
+        out.append(os.path.relpath(track, pdir))
+        added += 1
+else:
+    # A generated playlist whose paths are already relative to this same
+    # directory, so its lines carry over unchanged
+    pending = []
+    for line in read_lines(sys.argv[3]):
+        text = line.strip()
+        if text.startswith('#EXTM3U'):
+            continue
+        if not text or text.startswith('#'):
+            pending.append(line)
+            continue
+        if key(text, pdir) in seen:
+            pending = []
+            continue
+        seen.add(key(text, pdir))
+        out.extend(pending)
+        pending = []
+        out.append(line)
+        added += 1
+    out.extend(pending)
+
+tmp = playlist + '.tmp'
+with open(tmp, 'w', encoding='utf-8', errors='surrogateescape') as fh:
+    fh.write('\n'.join(out) + '\n')
+os.replace(tmp, playlist)
+
+total = sum(1 for l in out if l.strip() and not l.strip().startswith('#'))
+print('%d tracks, %d new' % (total, added))
+MERGEPY
+)
+
+# Merge a NUL-separated list of track paths on stdin into a playlist
+write_playlist() {
+    local playlist="$1"
+    mkdir -p "$(dirname "$playlist")"
+    echo "Playlist: $playlist ($(python3 -c "$MERGE_PY" "$playlist" paths))"
+}
+
+# Playlist of the destination-format tracks. By default that is everything
+# under the output root - the files just converted, those copied across, and
+# any that were already sitting there. With --no-copy-already-converted it is
+# only what this run produced.
+write_dir_playlist() {
+    local playlist="$1"
+    local search_root="$2"
+
+    if [[ "$COPY_ALREADY_CONVERTED" == true ]]; then
+        find "$search_root" -type f -name "*.$CONVERT_TO" -print0 | sort -z |
+            write_playlist "$playlist"
+    else
+        sort -z < "$MANIFEST" | write_playlist "$playlist"
+    fi
+}
+
+# Pick the AIFF PCM codec matching the source bit depth (AIFF is big-endian PCM)
+aiff_pcm_codec() {
+    local bits
+    bits=$(ffprobe -v error -select_streams a:0 \
+        -show_entries stream=bits_per_raw_sample \
+        -of default=noprint_wrappers=1:nokey=1 "$1")
+    case "$bits" in
+        24) echo pcm_s24be ;;
+        32) echo pcm_s32be ;;
+        *)  echo pcm_s16be ;;
+    esac
+}
+
 # Function to clean filename (remove numeric prefixes)
 clean_filename() {
     local filename="$1"
@@ -46,54 +327,297 @@ clean_filename() {
     echo "$basename" | sed -E 's/^[0-9]+[[:space:]]*//'
 }
 
+# Relative path of a source file from whichever base this run is walking
+source_relpath() {
+    if [[ -n "$SOURCE_DIR" ]]; then
+        relpath "$1" "$SOURCE_DIR"
+    else # M3U case - use relative path from M3U directory
+        relpath "$1" "$(dirname "$SOURCE_M3U")"
+    fi
+}
+
+# Compute the output path a given source file converts to
+output_path_for() {
+    local source_file="$1"
+
+    if [[ -z "$OUTPUT_PREFIX_DIR" ]]; then
+        # Output alongside source file - only the new basename is simplified,
+        # the existing source directories are left exactly as they are
+        echo "$(dirname "$source_file")/$(simplify_path "$(clean_filename "$source_file")").$CONVERT_TO"
+        return
+    fi
+
+    local relative_path=""
+    if [[ "$ORG_BY_ALBUM_ARTIST" == true ]]; then
+        relative_path=$(org_relpath_for "$source_file")
+        [[ -n "$relative_path" ]] || \
+            echo "! No usable tags, keeping source layout: $source_file" >&2
+    fi
+    if [[ -z "$relative_path" ]]; then
+        # Output to prefix directory with same relative path
+        relative_path=$(simplify_path "$(source_relpath "$source_file")")
+        relative_path="${relative_path%.*}"
+    fi
+    echo "$OUTPUT_PREFIX_DIR/$relative_path.$CONVERT_TO"
+}
+
+# Destination for a source file that is already in the target format. Its
+# name is kept as-is (only simplified); nothing is re-encoded.
+already_converted_dest() {
+    local source_file="$1"
+
+    if [[ -z "$OUTPUT_PREFIX_DIR" ]]; then
+        # Already exactly where it needs to be
+        echo "$source_file"
+        return
+    fi
+
+    local relative_path=""
+    if [[ "$ORG_BY_ALBUM_ARTIST" == true ]]; then
+        relative_path=$(org_relpath_for "$source_file")
+        [[ -z "$relative_path" ]] || relative_path="$relative_path.$CONVERT_TO"
+    fi
+    if [[ -z "$relative_path" ]]; then
+        relative_path=$(simplify_path "$(source_relpath "$source_file")")
+    fi
+    echo "$OUTPUT_PREFIX_DIR/$relative_path"
+}
+
+# Take on a source file that is already in the target format: record it for
+# the playlist and, when writing to a prefix dir, copy it across.
+handle_already_converted() {
+    local source_file="$1"
+    local dest
+    dest=$(already_converted_dest "$source_file")
+
+    if [[ "$source_file" -ef "$dest" ]]; then
+        # Already exactly where it belongs - never cleared, there is no copy.
+        # Registered as fixed so a later collision renames the other file.
+        echo "Already $CONVERT_TO, in place: $source_file"
+        resolve_destination "$dest" "$source_file" true || true
+        printf '%s\0' "$dest" >> "$MANIFEST"
+        COPIED_OUTPUT="$dest"
+        return 0
+    fi
+
+    if ! resolve_destination "$dest" "$source_file"; then
+        echo "= Duplicate of a file already handled, skipping: $source_file"
+        echo "  identical content already at: $RESOLVED_PATH"
+        COPIED_OUTPUT="$RESOLVED_PATH"
+        return 2
+    fi
+    dest="$RESOLVED_PATH"
+    COPIED_OUTPUT="$dest"
+
+    echo "Already $CONVERT_TO, copying: $source_file"
+    echo "Output: $dest"
+    mkdir -p "$(dirname "$dest")"
+    if cp -p "$source_file" "$dest"; then
+        echo "✓ Successfully copied: $(basename "$source_file")"
+        printf '%s\0' "$dest" >> "$MANIFEST"
+        if [[ "$CLEAR_SRC" == true ]] && ! move_source_file "$source_file" "$dest"; then
+            CLEAR_SKIPPED=$((CLEAR_SKIPPED + 1))
+        fi
+        return 0
+    fi
+    echo "✗ Failed to copy: $(basename "$source_file")"
+    return 1
+}
+
+# Reserve an output path for one source. Tag-based organisation, track-number
+# stripping and unicode simplification can all map two sources onto the same
+# destination. When that happens the sources are compared by SHA-256: identical
+# content means one copy is enough, and genuinely different content is kept
+# apart by numbering every file involved - the first is renamed to " (1)" and
+# the next becomes " (2)". Hashes are only computed once a collision actually
+# occurs, so the ordinary case reads no extra bytes.
+RESOLVE_PY=$(cat <<'PYRESOLVE'
+import hashlib, json, os, sys
+
+registry_path, base, source, fixed = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+deleted_base, source_root = sys.argv[5], sys.argv[6]
+
+try:
+    with open(registry_path, encoding='utf-8') as fh:
+        registry = json.load(fh)
+except Exception:
+    registry = {}
+
+
+def locate(path):
+    # --clear-src may already have moved an earlier source aside; its copy
+    # under the deleted directory is still the file we need to hash
+    if os.path.exists(path):
+        return path
+    if deleted_base and source_root:
+        moved = os.path.join(deleted_base, os.path.relpath(path, source_root))
+        if os.path.exists(moved):
+            return moved
+    return path
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with open(locate(path), 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def numbered(path, n):
+    root, ext = os.path.splitext(path)
+    return '%s (%d)%s' % (root, n, ext)
+
+
+action, use, rename_from, rename_to = 'new', base, '', ''
+entries = registry.get(base)
+
+if not entries:
+    registry[base] = [{'source': source, 'path': base, 'fixed': fixed == 'true'}]
+else:
+    # A file that cannot be hashed is treated as different rather than as a
+    # match, so an unreadable source is never silently dropped
+    try:
+        source_sha = sha(source)
+    except OSError:
+        source_sha = None
+
+    match = None
+    for entry in entries:
+        if 'sha' not in entry:
+            try:
+                entry['sha'] = sha(entry['source'])
+            except OSError:
+                entry['sha'] = None
+        if source_sha is not None and entry['sha'] == source_sha:
+            match = entry
+            break
+
+    if match:
+        action, use = 'duplicate', match['path']
+    else:
+        # Number the first file too, unless it is a source sitting in place
+        # and must not be touched
+        if len(entries) == 1 and entries[0]['path'] == base and not entries[0].get('fixed'):
+            rename_from = base
+            rename_to = numbered(base, 1)
+            entries[0]['path'] = rename_to
+        n = len(entries) + 1
+        while os.path.exists(numbered(base, n)):
+            n += 1
+        use = numbered(base, n)
+        entries.append({'source': source, 'sha': source_sha, 'path': use})
+    registry[base] = entries
+
+with open(registry_path, 'w', encoding='utf-8') as fh:
+    json.dump(registry, fh)
+
+print(action)
+print(use)
+print(rename_from)
+print(rename_to)
+PYRESOLVE
+)
+
+# Point any already-recorded reference at a file's new name after a rename
+patch_recorded_path() {
+    local old="$1" new="$2"
+
+    python3 -c '
+import os, sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+if os.path.isfile(path):
+    with open(path, "rb") as fh:
+        parts = fh.read().split(b"\0")
+    old_b, new_b = os.fsencode(old), os.fsencode(new)
+    with open(path, "wb") as fh:
+        fh.write(b"\0".join(new_b if p == old_b else p for p in parts))
+' "$MANIFEST" "$old" "$new"
+
+    if [[ -n "${NEW_M3U_TMP:-}" && -f "${NEW_M3U_TMP:-/nonexistent}" ]]; then
+        python3 -c '
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+    lines = fh.read().splitlines()
+with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
+    fh.write("\n".join(new if line == old else line for line in lines) + "\n")
+' "$NEW_M3U_TMP" "$(relpath "$old" "$NEW_M3U_DIR")" "$(relpath "$new" "$NEW_M3U_DIR")"
+    fi
+}
+
+# Resolve where a source should be written, handling collisions. Sets
+# RESOLVED_PATH, and returns 1 when the content is a duplicate already handled.
+RESOLVED_PATH=""
+resolve_destination() {
+    local base="$1" source_file="$2" fixed="${3:-false}"
+    local action rename_from rename_to
+
+    { read -r action; read -r RESOLVED_PATH; read -r rename_from; read -r rename_to; } < <(
+        python3 -c "$RESOLVE_PY" "$CLAIMS" "$base" "$source_file" "$fixed" \
+            "${DELETED_BASE:-}" "$SOURCE_ROOT"
+    )
+    # A failed resolve leaves nothing to act on; keep the original target
+    [[ -n "$RESOLVED_PATH" ]] || RESOLVED_PATH="$base"
+
+    if [[ -n "$rename_from" && -e "$rename_from" ]]; then
+        mv "$rename_from" "$rename_to"
+        echo "  same name, different audio - renamed earlier file to: $(basename "$rename_to")"
+        patch_recorded_path "$rename_from" "$rename_to"
+    fi
+
+    [[ "$action" != "duplicate" ]]
+}
+
+# True when a file's extension already matches the target format
+is_already_converted() {
+    local ext="${1##*.}"
+    [[ "$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')" == "$CONVERT_TO" ]]
+}
+
 # Function to convert a single file
 convert_file() {
     local source_file="$1"
-    local output_prefix="$2"
-    local convert_format="$3"
-    
-    # Get relative path from source base directory
-    local relative_path=""
-    if [[ -n "$SOURCE_DIR" ]]; then
-        relative_path=$(relpath "$source_file" "$SOURCE_DIR")
-    else # M3U case - use relative path from M3U directory
-        local m3u_dir=$(dirname "$SOURCE_M3U")
-        relative_path=$(relpath "$source_file" "$m3u_dir")
+    local convert_format="$CONVERT_TO"
+    local output_file="${2:-}"
+    [[ -n "$output_file" ]] || output_file=$(output_path_for "$source_file")
+    CONVERTED_OUTPUT="$output_file"
+
+    if ! resolve_destination "$output_file" "$source_file"; then
+        echo "= Duplicate of a file already converted, skipping: $source_file"
+        echo "  identical content already at: $RESOLVED_PATH"
+        CONVERTED_OUTPUT="$RESOLVED_PATH"
+        return 2
     fi
-    
-    # Determine output directory and filename
-    local output_file=""
-    if [[ -z "$output_prefix" ]]; then
-        # Output alongside source file
-        output_file=$(dirname "$source_file")/$(clean_filename "$source_file").$convert_format
-    else
-        # Output to prefix directory with same relative path
-        output_file="$output_prefix/${relative_path%.*}.$convert_format"
-    fi
-    
+    output_file="$RESOLVED_PATH"
+    CONVERTED_OUTPUT="$output_file"
+
     # Create output directory if it doesn't exist
-    local output_dir=$(dirname "$output_file")
-    mkdir -p "$output_dir"
-    
+    mkdir -p "$(dirname "$output_file")"
+
     echo "Converting: $source_file"
     echo "Output: $output_file"
     
-    # Perform conversion based on format
+    # Perform conversion based on format. Sample rate and channel layout are
+    # left untouched so they follow the source (mp3 caps at 48kHz; ffmpeg
+    # picks the nearest supported rate for hi-res sources).
+    local ffmpeg_status=0
     case "$convert_format" in
         aiff)
-            ffmpeg -nostdin -i "$source_file" -write_id3v2 1 -c:v copy -acodec pcm_s16le -ar 44100 -ac 2 -map_metadata 0 -id3v2_version 3 "$output_file" >> "/tmp/ffmpeg-aiff-${DATE_SUFFIX}.log" 2>&1
+            ffmpeg -nostdin -i "$source_file" -write_id3v2 1 -c:v copy -c:a "$(aiff_pcm_codec "$source_file")" -map_metadata 0 -id3v2_version 3 "$output_file" >> "/tmp/ffmpeg-aiff-${DATE_SUFFIX}.log" 2>&1 || ffmpeg_status=$?
             ;;
         mp3)
-            ffmpeg -nostdin -i "$source_file" -c:v copy -acodec libmp3lame -ab 320k -ar 44100 -ac 2 -map_metadata 0 -id3v2_version 3 -write_id3v1 1 "$output_file" >> "/tmp/ffmpeg-mp3-${DATE_SUFFIX}.log" 2>&1
+            ffmpeg -nostdin -i "$source_file" -c:v copy -c:a libmp3lame -b:a 320k -map_metadata 0 -id3v2_version 3 -write_id3v1 1 "$output_file" >> "/tmp/ffmpeg-mp3-${DATE_SUFFIX}.log" 2>&1 || ffmpeg_status=$?
             ;;
     esac
-    
+
     # Check if conversion was successful
-    if [[ -s "$output_file" ]]; then
+    if [[ $ffmpeg_status -eq 0 && -s "$output_file" ]]; then
         echo "✓ Successfully converted: $(basename "$source_file")"
+        printf '%s\0' "$output_file" >> "$MANIFEST"
         return 0
     else
-        echo "✗ Failed to convert: $(basename "$source_file")"
+        echo "✗ Failed to convert: $(basename "$source_file") (see /tmp/ffmpeg-${convert_format}-${DATE_SUFFIX}.log)"
         return 1
     fi
 }
@@ -101,8 +625,22 @@ convert_file() {
 # Function to move source file after successful conversion
 move_source_file() {
     local source_file="$1"
+    local dest_file="${2:-}"
     local deleted_base="/tmp/deleted/$DATE_SUFFIX"
-    
+
+    # A source may only be cleared once a distinct destination file exists to
+    # replace it. Without this, a file that is already in the right place, or
+    # one whose output got overwritten by another source, would be moved away
+    # leaving no copy behind.
+    if [[ -z "$dest_file" || ! -s "$dest_file" ]]; then
+        echo "! Not clearing (no destination file): $source_file"
+        return 1
+    fi
+    if [[ "$source_file" -ef "$dest_file" ]]; then
+        echo "! Not clearing (already in place, source is the destination): $source_file"
+        return 1
+    fi
+
     # Get relative path for maintaining directory structure
     local relative_path=""
     if [[ -n "$SOURCE_DIR" ]]; then
@@ -143,6 +681,19 @@ while [[ $# -gt 0 ]]; do
             CLEAR_SRC=true
             shift
             ;;
+        --no-unicode-simplify)
+            UNICODE_SIMPLIFY=false
+            shift
+            ;;
+        --no-copy-already-converted)
+            COPY_ALREADY_CONVERTED=false
+            shift
+            ;;
+        --no-org-by-album-artist)
+            ORG_BY_ALBUM_ARTIST=false
+            ORG_FLAG_PASSED=true
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -179,6 +730,21 @@ if [[ -n "$SOURCE_DIR" && -n "$SOURCE_M3U" ]]; then
     exit 1
 fi
 
+# Drop trailing slashes so constructed paths stay tidy
+while [[ "$SOURCE_DIR" == */ && "$SOURCE_DIR" != "/" ]]; do SOURCE_DIR="${SOURCE_DIR%/}"; done
+while [[ "$OUTPUT_PREFIX_DIR" == */ && "$OUTPUT_PREFIX_DIR" != "/" ]]; do OUTPUT_PREFIX_DIR="${OUTPUT_PREFIX_DIR%/}"; done
+
+# Organising by tags rewrites the whole path, so it only makes sense when
+# writing into a directory of its own
+if [[ -z "$OUTPUT_PREFIX_DIR" ]]; then
+    if [[ "$ORG_FLAG_PASSED" == true ]]; then
+        echo "Error: --no-org-by-album-artist only applies with --output-prefix-dir"
+        echo "       (without one, files stay alongside their sources)"
+        exit 1
+    fi
+    ORG_BY_ALBUM_ARTIST=false
+fi
+
 if [[ -z "$OUTPUT_PREFIX_DIR" ]]; then
     echo "Output prefix directory is empty - files will be placed alongside source files"
 else
@@ -201,8 +767,26 @@ else
     echo "Source M3U: $SOURCE_M3U"
 fi
 
+# Base that source paths are relative to, used to follow cleared sources
+if [[ -n "$SOURCE_DIR" ]]; then
+    SOURCE_ROOT="$SOURCE_DIR"
+else
+    SOURCE_ROOT=$(dirname "$SOURCE_M3U")
+fi
+
 echo "Convert to: $CONVERT_TO"
+[[ "$UNICODE_SIMPLIFY" == true ]] || echo "Unicode simplification: off"
+[[ "$ORG_BY_ALBUM_ARTIST" != true ]] || \
+    echo "Organising by tags: {Band}/{Album}/{Artist} - {Title}.$CONVERT_TO"
+[[ "$COPY_ALREADY_CONVERTED" == true ]] || echo "Already-$CONVERT_TO files: ignored"
 echo ""
+
+# Tracks produced by this run (converted, plus copied when enabled), and the
+# output paths already spoken for so two sources cannot collapse onto one
+MANIFEST=$(mktemp)
+CLAIMS=$(mktemp)
+CONVERTED_OUTPUT=""
+trap 'rm -f "$MANIFEST" "$CLAIMS"' EXIT
 
 # Setup deleted directory if clear-src is enabled
 if [[ "$CLEAR_SRC" == true ]]; then
@@ -214,58 +798,225 @@ fi
 # Process files
 CONVERSION_ERRORS=0
 PROCESSED_COUNT=0
+COPIED_COUNT=0
+CLEAR_SKIPPED=0
+DUPLICATE_COUNT=0
+COPIED_OUTPUT=""
 
 if [[ -n "$SOURCE_DIR" ]]; then
     # Process directory - find all FLAC files recursively
     echo "Walking directory: $SOURCE_DIR"
     while IFS= read -r -d '' file; do
-        if convert_file "$file" "$OUTPUT_PREFIX_DIR" "$CONVERT_TO"; then
-            PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
-            if [[ "$CLEAR_SRC" == true ]]; then
-                move_source_file "$file"
+        rc=0
+        convert_file "$file" || rc=$?
+        if [[ $rc -eq 0 || $rc -eq 2 ]]; then
+            if [[ $rc -eq 0 ]]; then
+                PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+            else
+                DUPLICATE_COUNT=$((DUPLICATE_COUNT + 1))
+            fi
+            # Safe to clear either way: a matching destination file exists
+            if [[ "$CLEAR_SRC" == true ]] && ! move_source_file "$file" "$CONVERTED_OUTPUT"; then
+                CLEAR_SKIPPED=$((CLEAR_SKIPPED + 1))
             fi
         else
             CONVERSION_ERRORS=$((CONVERSION_ERRORS + 1))
         fi
         echo ""
     done < <(find "$SOURCE_DIR" -type f -name "*.flac" -print0)
+
+    # Files already in the target format. Without a prefix dir they are
+    # already where they belong and the playlist walk picks them up, so there
+    # is only work to do when copying into a prefix dir.
+    if [[ "$COPY_ALREADY_CONVERTED" == true && -n "$OUTPUT_PREFIX_DIR" ]]; then
+        while IFS= read -r -d '' file; do
+            rc=0
+            handle_already_converted "$file" || rc=$?
+            if [[ $rc -eq 0 ]]; then
+                COPIED_COUNT=$((COPIED_COUNT + 1))
+            elif [[ $rc -eq 2 ]]; then
+                DUPLICATE_COUNT=$((DUPLICATE_COUNT + 1))
+                if [[ "$CLEAR_SRC" == true ]] && ! move_source_file "$file" "$COPIED_OUTPUT"; then
+                    CLEAR_SKIPPED=$((CLEAR_SKIPPED + 1))
+                fi
+            else
+                CONVERSION_ERRORS=$((CONVERSION_ERRORS + 1))
+            fi
+            echo ""
+        done < <(find "$SOURCE_DIR" -type f -name "*.$CONVERT_TO" -print0)
+    fi
+
+    # Playlist of every destination-format track, at the root of wherever the
+    # converted files landed (the output prefix dir, else the source dir).
+    DIR_NAME=$(simplify_path "$(basename "$(abspath "$SOURCE_DIR")")")
+    [[ -n "$DIR_NAME" ]] || DIR_NAME="tracks"
+    if [[ -n "$OUTPUT_PREFIX_DIR" ]]; then
+        write_dir_playlist "$OUTPUT_PREFIX_DIR/$DIR_NAME.$CONVERT_TO.m3u" "$OUTPUT_PREFIX_DIR"
+    else
+        write_dir_playlist "$SOURCE_DIR/$DIR_NAME.$CONVERT_TO.m3u" "$SOURCE_DIR"
+    fi
 else
     # Process M3U file
     echo "Processing M3U playlist: $SOURCE_M3U"
     M3U_DIR=$(dirname "$SOURCE_M3U")
+
+    # Where the playlist for the converted files goes:
+    #   --clear-src           update the source M3U in place
+    #   --output-prefix-dir   <prefix-dir>/<name>.<format>.<ext>
+    #   otherwise             alongside the source M3U as <name>.<format>.<ext>
+    M3U_NAME=$(basename "$SOURCE_M3U")
+    M3U_EXT="${M3U_NAME##*.}"
+    [[ "$M3U_NAME" == *.* ]] || M3U_EXT="m3u"
+    if [[ "$CLEAR_SRC" == true ]]; then
+        # Overwrites the original, so its name has to stay exactly as it is
+        NEW_M3U="$SOURCE_M3U"
+    else
+        NEW_M3U_NAME="$(simplify_path "${M3U_NAME%.*}").$CONVERT_TO.$M3U_EXT"
+        if [[ -n "$OUTPUT_PREFIX_DIR" ]]; then
+            NEW_M3U="$OUTPUT_PREFIX_DIR/$NEW_M3U_NAME"
+        else
+            NEW_M3U="$M3U_DIR/$NEW_M3U_NAME"
+        fi
+    fi
+    NEW_M3U_DIR=$(dirname "$NEW_M3U")
+    NEW_M3U_TMP=$(mktemp)
+    trap 'rm -f "$NEW_M3U_TMP" "$MANIFEST" "$CLAIMS"' EXIT
     
-    while IFS= read -r line; do
-        # Skip comments and empty lines
-        if [[ "$line" =~ ^# ]] || [[ -z "$line" ]]; then
+    # #EXTINF lines are held back until their track is written, so an entry
+    # that gets dropped does not leave its description behind
+    PENDING=""
+    flush_pending() {
+        [[ -n "$PENDING" ]] && printf '%s' "$PENDING" >> "$NEW_M3U_TMP"
+        PENDING=""
+    }
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # The header belongs to the playlist, not to any one track
+        if [[ "$line" =~ ^#EXTM3U ]]; then
+            printf '%s\n' "$line" >> "$NEW_M3U_TMP"
             continue
         fi
-        
+        # Buffer other comments and blank lines until a track claims them
+        if [[ "$line" =~ ^# ]] || [[ -z "$line" ]]; then
+            PENDING+="$line"$'\n'
+            continue
+        fi
+
         # Resolve file path (handle relative paths in M3U)
-        local source_file="$line"
+        source_file="$line"
         if [[ ! "$source_file" =~ ^/ ]]; then
             source_file="$M3U_DIR/$line"
         fi
-        
-        if [[ ! -f "$source_file" ]]; then
-            echo "Warning: File not found: $source_file"
+
+        # Entries already in the target format are copied, not re-encoded
+        if is_already_converted "$source_file"; then
+            if [[ "$COPY_ALREADY_CONVERTED" != true ]]; then
+                echo "Skipping already-$CONVERT_TO entry: $source_file"
+                PENDING=""
+                echo ""
+                continue
+            fi
+            already_dest=$(already_converted_dest "$source_file")
+            if [[ -f "$source_file" ]]; then
+                rc=0
+                handle_already_converted "$source_file" || rc=$?
+                if [[ $rc -eq 0 || $rc -eq 2 ]]; then
+                    if [[ $rc -eq 0 ]]; then
+                        COPIED_COUNT=$((COPIED_COUNT + 1))
+                    else
+                        DUPLICATE_COUNT=$((DUPLICATE_COUNT + 1))
+                        if [[ "$CLEAR_SRC" == true ]] && \
+                           ! move_source_file "$source_file" "$COPIED_OUTPUT"; then
+                            CLEAR_SKIPPED=$((CLEAR_SKIPPED + 1))
+                        fi
+                    fi
+                    flush_pending
+                    relpath "$COPIED_OUTPUT" "$NEW_M3U_DIR" >> "$NEW_M3U_TMP"
+                else
+                    CONVERSION_ERRORS=$((CONVERSION_ERRORS + 1))
+                    flush_pending
+                    printf '%s\n' "$line" >> "$NEW_M3U_TMP"
+                fi
+            elif [[ -s "$already_dest" ]]; then
+                echo "Source gone, using existing copy: $already_dest"
+                flush_pending
+                relpath "$already_dest" "$NEW_M3U_DIR" >> "$NEW_M3U_TMP"
+            else
+                echo "Warning: File not found: $source_file"
+                flush_pending
+                printf '%s\n' "$line" >> "$NEW_M3U_TMP"
+            fi
+            echo ""
             continue
         fi
-        
-        if convert_file "$source_file" "$OUTPUT_PREFIX_DIR" "$CONVERT_TO"; then
-            PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
-            if [[ "$CLEAR_SRC" == true ]]; then
-                move_source_file "$source_file"
+
+        output_file=$(output_path_for "$source_file")
+
+        if [[ ! -f "$source_file" ]]; then
+            if [[ -s "$output_file" ]]; then
+                # Source already moved/deleted but a converted copy exists
+                echo "Source gone, using existing conversion: $output_file"
+                flush_pending
+                relpath "$output_file" "$NEW_M3U_DIR" >> "$NEW_M3U_TMP"
+            else
+                echo "Warning: File not found: $source_file"
+                # Keep the original entry so no information is lost
+                flush_pending
+                printf '%s\n' "$line" >> "$NEW_M3U_TMP"
+            fi
+            continue
+        fi
+
+        rc=0
+        convert_file "$source_file" "$output_file" || rc=$?
+        if [[ $rc -eq 0 || $rc -eq 2 ]]; then
+            if [[ $rc -eq 0 ]]; then
+                PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+            else
+                DUPLICATE_COUNT=$((DUPLICATE_COUNT + 1))
+            fi
+            flush_pending
+            relpath "$CONVERTED_OUTPUT" "$NEW_M3U_DIR" >> "$NEW_M3U_TMP"
+            if [[ "$CLEAR_SRC" == true ]] && \
+               ! move_source_file "$source_file" "$CONVERTED_OUTPUT"; then
+                CLEAR_SKIPPED=$((CLEAR_SKIPPED + 1))
             fi
         else
             CONVERSION_ERRORS=$((CONVERSION_ERRORS + 1))
+            # Keep the original entry so the playlist stays complete
+            flush_pending
+            printf '%s\n' "$line" >> "$NEW_M3U_TMP"
         fi
         echo ""
     done < "$SOURCE_M3U"
+
+    # Any trailing comments that never found a track
+    flush_pending
+
+    # Write the playlist for the converted files
+    if [[ "$NEW_M3U" == "$SOURCE_M3U" ]]; then
+        # --clear-src: the source playlist is rewritten in place. Its new
+        # contents are a transformation of its old ones, so every entry is
+        # already accounted for; the original is kept alongside the sources.
+        cp -p "$SOURCE_M3U" "$DELETED_BASE/$M3U_NAME"
+        echo "Original playlist copied to: $DELETED_BASE/$M3U_NAME"
+        cat "$NEW_M3U_TMP" > "$NEW_M3U"
+        echo "Playlist updated in place: $NEW_M3U"
+    else
+        echo "Playlist: $NEW_M3U ($(python3 -c "$MERGE_PY" "$NEW_M3U" m3u "$NEW_M3U_TMP"))"
+    fi
+    rm -f "$NEW_M3U_TMP"
 fi
 
 # Summary
 echo "Conversion complete!"
 echo "Processed $PROCESSED_COUNT files successfully."
+if [[ $COPIED_COUNT -gt 0 ]]; then
+    echo "Copied $COPIED_COUNT files that were already $CONVERT_TO."
+fi
+if [[ $DUPLICATE_COUNT -gt 0 ]]; then
+    echo "Skipped $DUPLICATE_COUNT duplicate(s) - identical content already present."
+fi
 
 if [[ $CONVERSION_ERRORS -gt 0 ]]; then
     echo "There were $CONVERSION_ERRORS conversion errors."
@@ -275,4 +1026,7 @@ fi
 
 if [[ "$CLEAR_SRC" == true ]]; then
     echo "Source files moved to: /tmp/deleted/$DATE_SUFFIX"
+    if [[ $CLEAR_SKIPPED -gt 0 ]]; then
+        echo "$CLEAR_SKIPPED source file(s) left in place - no separate destination file to replace them."
+    fi
 fi

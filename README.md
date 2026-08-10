@@ -28,6 +28,44 @@ Create a file at `~/.config/deezer-flac-download/config.toml` based on
 
 You can also download multiple albums: `go run . album 1234 2345 3456`.
 
+## Preparing tracks for CDJs
+
+`track_format_converter` turns a folder of downloads into a library a
+CDJ-2000 class player can read. Run `./track_format_converter --help` for the
+full reference; the short version:
+
+```bash
+./track_format_converter --source-dir ~/Downloads --output-prefix-dir ~/dj/music
+```
+
+The destination format follows the source, so there is nothing to pick:
+
+| Source | Becomes |
+| --- | --- |
+| flac, wav, aiff, alac, ape, wv, tta | aiff, capped at 24-bit / 48kHz |
+| mp3 | mp3, copied with its audio untouched |
+| aac, m4a, ogg, opus, wma | mp3 320k |
+
+Nothing is ever upsampled — 44.1kHz/16-bit stays exactly that — and rates only
+come down within their own family (88.2 → 44.1, 96 → 48) so each reduction is
+an exact ratio. Lossy audio is never expanded into a lossless container, and
+mp3 is never re-encoded. Levels are measured into `PEAK_DBFS` and
+`LOUDNESS_LUFS` tags but never altered, since a gain change cannot be undone
+exactly. Tracks under three minutes are skipped.
+
+Output is organised from each track's own tags as
+`{Band}/{Album}/{Artist} - {Title}`, and a `<name>.cdj.m3u` playlist is written
+alongside it. Re-running adds to that playlist rather than replacing it.
+
+To re-check a library you already built — dropping tracks whose files have
+moved away or that are too short, and re-encoding anything above spec:
+
+```bash
+./track_format_converter --source-m3u ~/dj/music/library.cdj.m3u --output-prefix-dir "" --cleanup
+```
+
+Requires `ffmpeg`, `ffprobe` and `python3`.
+
 ## FAQ
 
 **How do I use this on Windows?**

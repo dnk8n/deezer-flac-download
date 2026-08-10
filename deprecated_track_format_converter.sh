@@ -1,8 +1,11 @@
 #!/bin/bash
 
-# Script: track_format_converter
+# Script: deprecated_track_format_converter.sh
+# Status: DEPRECATED - superseded by ./track_format_converter, which handles
+#         more source formats, caps quality instead of guessing, and manages
+#         playlists. Kept only for reference.
 # Description: Convert FLAC files from an M3U playlist to XDJ-700 compatible AIFF and MP3 formats
-# Usage: ./track_format_converter <path_to_m3u_playlist>
+# Usage: ./deprecated_track_format_converter.sh <path_to_m3u_playlist>
 
 # Check if input provided
 if [ $# -eq 0 ]; then

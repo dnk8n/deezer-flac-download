@@ -12,6 +12,7 @@ set -euo pipefail
 LOSSLESS_EXT="aiff"
 LOSSY_EXT="mp3"
 PLAYLIST_LABEL="cdj"
+PLAYLIST_NAME="playlist.cdj.m3u"
 SOURCE_DIR=""
 SOURCE_M3U=""
 OUTPUT_PREFIX_DIR=""
@@ -79,12 +80,21 @@ OPTIONS
                             never moved unless a separate destination file is
                             really there.
   --min-duration SECONDS    Change the ${MIN_DURATION}s minimum.
-  --cleanup                 Re-check an existing library against these rules.
-                            With --source-m3u this runs on its own, reviewing
-                            that playlist and stopping: entries whose file has
-                            gone are dropped, tracks under the minimum are
-                            dropped and moved aside, over-spec lossless files
-                            are re-encoded in place. Nothing is deleted.
+  --cleanup                 Also migrate the destination playlist. Add this
+                            to any normal command: after the sources are
+                            handled, every track already in the destination is
+                            re-checked against current settings, so a library
+                            built by an older version catches up. Entries whose
+                            file has gone are dropped; tracks under the minimum
+                            are dropped and moved aside; over-spec files are
+                            re-encoded; missing level tags are measured and
+                            added; anything sitting at an out-of-date path or
+                            with old-style characters in its name is moved to
+                            the current layout. A file whose title is only
+                            guessed from its filename is left where it is,
+                            since re-deriving a name from a name it already has
+                            would not settle. Nothing is deleted - files taken
+                            out go to /tmp/deleted/<timestamp>/cleanup.
   --no-peak-metadata        Skip level measurement. By default each output
                             carries PEAK_DBFS and LOUDNESS_LUFS tags, measured
                             and recorded only - levels are never altered,
@@ -113,20 +123,34 @@ numbered - "Track (1).aiff", "Track (2).aiff" - so nothing is overwritten.
 
 PLAYLISTS
 
-A playlist of the playable results is written as <name>.$PLAYLIST_LABEL.m3u, at the root
-of --output-prefix-dir, or beside the source otherwise. In M3U mode with
---clear-src the source playlist is updated in place and the original is kept
-in /tmp/deleted/<timestamp>.
+One playlist per destination, always called $PLAYLIST_NAME: at the root
+of --output-prefix-dir, or beside the source when there is no prefix dir. The
+name does not change with the source, so every run keeps building the same
+list rather than scattering one playlist per source folder.
 
-Existing playlists are added to, not replaced: their lines survive and only
-unlisted tracks are appended. Entries whose file has gone are removed and
+$PLAYLIST_NAME is refused as a source. Reading and rewriting the same file
+would overwrite it, so rename it first if you really mean to feed it back in.
+
+Entries are ordered by path, so the listing follows the folder structure and
+the same library always produces the same file. Each track appears once: an
+entry already present is never added again, and duplicates already in the
+playlist are collapsed, matching on the resolved path so a relative and an
+absolute reference to one file count as the same track. Any #EXTINF line
+travels with the track it describes.
+
+An existing playlist is added to, not replaced: its tracks survive and only
+unlisted ones are appended. Entries whose file has gone are removed and
 reported. If most entries vanish at once the playlist is left untouched, on
 the assumption the drive holding them is simply not mounted.
+
+With --clear-src in M3U mode the source playlist is left where it is and a
+copy goes to /tmp/deleted/<timestamp>; its tracks have moved, so it is stale
+by definition - $PLAYLIST_NAME is the one to use afterwards.
 
 Examples:
   $0 --source-dir ~/Downloads --output-prefix-dir ~/dj/music
   $0 --source-dir ~/Downloads --output-prefix-dir ~/dj/music --clear-src
-  $0 --source-m3u ~/dj/music/library.$PLAYLIST_LABEL.m3u --output-prefix-dir "" --cleanup
+  $0 --source-dir ~/Downloads --output-prefix-dir ~/dj/music --cleanup
 EOF
 }
 
@@ -186,6 +210,42 @@ def component(value, do_simplify, limit=180):
 PYCOMMON
 )
 
+# Work out the artist and title a file should carry when its tags are thin.
+# Filenames overwhelmingly read "Artist - Title", so that is what is read off
+# them. Anything already tagged is left alone. Printed as two lines, artist
+# then title; an empty line means "nothing to add".
+INFER_MAIN=$(cat <<'PYINFER'
+import json
+
+name = sys.argv[1]
+
+raw = json.load(sys.stdin).get('format', {}).get('tags') or {}
+tags = {k.lower(): (v or '').strip() for k, v in raw.items()}
+artist, title = tags.get('artist', ''), tags.get('title', '')
+
+left, sep, right = name.partition(' - ')
+left, right = left.strip(), right.strip()
+same = lambda a, b: a.casefold() == b.casefold()
+
+new_artist, new_title = '', ''
+if sep and left and right:
+    if not artist and not title:
+        new_artist, new_title = left, right
+    elif artist and not title:
+        # "Harry Wills - Corsica Gambit" under artist "Harry Wills" means the
+        # title is the remainder, not the whole filename
+        new_title = right if same(left, artist) else name
+    elif title and not artist:
+        if same(right, title):
+            new_artist = left
+elif not title and name:
+    new_title = name
+
+print(new_artist)
+print(new_title)
+PYINFER
+)
+
 SIMPLIFY_MAIN=$(cat <<'PYSIMPLIFY'
 out = []
 for part in sys.argv[1].split('/'):
@@ -204,6 +264,12 @@ import json
 
 do_simplify = sys.argv[1] == 'true'
 fallback_title = sys.argv[2]
+# When set, a path is only offered if the title is a real tag. The filename
+# fallback is fine for naming a new file, but it already reads
+# "Artist - Title", so feeding it back in would prepend the artist a second
+# time on every pass.
+require_title = len(sys.argv) > 3 and sys.argv[3] == 'true'
+fallback_artist = sys.argv[4] if len(sys.argv) > 4 else ''
 
 raw = json.load(sys.stdin).get('format', {}).get('tags') or {}
 tags = {k.lower(): (v or '').strip() for k, v in raw.items()}
@@ -217,7 +283,7 @@ def tag(*names):
 
 
 band = tag('album_artist', 'albumartist', 'band')
-artist = tag('artist')
+artist = tag('artist') or fallback_artist
 album = tag('album')
 title = tag('title')
 
@@ -225,6 +291,10 @@ title = tag('title')
 # the source folders almost certainly say more than 'Unknown Artist' would,
 # so the caller is told to keep them.
 if not band and not artist:
+    print('')
+    sys.exit(0)
+
+if require_title and not title:
     print('')
     sys.exit(0)
 
@@ -240,6 +310,7 @@ PYORG
 
 SIMPLIFY_SCRIPT="$PY_COMMON"$'\n'"$SIMPLIFY_MAIN"
 ORG_SCRIPT="$PY_COMMON"$'\n'"$ORG_MAIN"
+INFER_SCRIPT="$PY_COMMON"$'\n'"$INFER_MAIN"
 
 simplify_path() {
     if [[ "$UNICODE_SIMPLIFY" == true ]]; then
@@ -252,8 +323,21 @@ simplify_path() {
 # Relative path (no extension) built from the track's tags, or empty when the
 # tags cannot support it
 org_relpath_for() {
+    local title="${INFER_TITLE:-}"
+    [[ -n "$title" ]] || title=$(clean_filename "$1")
     ffprobe -v quiet -print_format json -show_entries format_tags "$1" 2>/dev/null |
-        python3 -c "$ORG_SCRIPT" "$UNICODE_SIMPLIFY" "$(clean_filename "$1")"
+        python3 -c "$ORG_SCRIPT" "$UNICODE_SIMPLIFY" "$title" "${2:-false}" "${INFER_ARTIST:-}"
+}
+
+# Sets INFER_ARTIST / INFER_TITLE to whatever is missing and can be read off
+# the filename. Empty means the file already carries that tag.
+INFER_ARTIST=""
+INFER_TITLE=""
+infer_tags() {
+    { read -r INFER_ARTIST; read -r INFER_TITLE; } < <(
+        ffprobe -v quiet -print_format json -show_entries format_tags "$1" 2>/dev/null |
+            python3 -c "$INFER_SCRIPT" "$(clean_filename "$1")"
+    )
 }
 
 # Merge tracks into a destination playlist. An existing playlist is never
@@ -362,6 +446,65 @@ print('%d tracks, %d new, %d dead removed' % (total, added, len(dead)))
 MERGEPY
 )
 
+# Put a playlist into its canonical shape: one entry per track, ordered by
+# path so the listing follows the folder structure, with each #EXTINF kept
+# attached to the track it describes. Exact duplicates are collapsed; two
+# different files never merge, because the key is the resolved path.
+SORT_PY=$(cat <<'PYSORT'
+import os, sys
+
+path = sys.argv[1]
+pdir = os.path.dirname(os.path.abspath(path)) or '.'
+with open(path, encoding='utf-8', errors='surrogateescape') as fh:
+    lines = fh.read().splitlines()
+
+header, blocks, pending = [], [], []
+for line in lines:
+    text = line.strip()
+    if text.startswith('#EXTM3U'):
+        header.append(line)
+    elif not text or text.startswith('#'):
+        pending.append(line)
+    else:
+        key = text if os.path.isabs(text) else os.path.join(pdir, text)
+        blocks.append((os.path.normpath(key), pending + [line]))
+        pending = []
+
+seen, unique, dropped = set(), [], 0
+for key, block in blocks:
+    if key in seen:
+        dropped += 1
+        continue
+    seen.add(key)
+    unique.append((key, block))
+
+before = [k for k, _ in unique]
+unique.sort(key=lambda item: item[0])
+reordered = [k for k, _ in unique] != before
+
+out = header or ['#EXTM3U']
+for _, block in unique:
+    out.extend(block)
+out.extend(pending)
+
+with open(path, 'w', encoding='utf-8', errors='surrogateescape') as fh:
+    fh.write('\n'.join(out) + '\n')
+
+notes = []
+if dropped:
+    notes.append('%d duplicate%s removed' % (dropped, '' if dropped == 1 else 's'))
+if reordered:
+    notes.append('reordered')
+print(', '.join(notes))
+PYSORT
+)
+
+normalise_playlist() {
+    local note
+    note=$(python3 -c "$SORT_PY" "$1")
+    [[ -z "$note" ]] || echo "  ($note)"
+}
+
 # Merge a NUL-separated list of track paths on stdin into a playlist
 write_playlist() {
     local playlist="$1" summary rc=0
@@ -373,6 +516,7 @@ write_playlist() {
         return 0
     fi
     echo "Playlist: $playlist ($summary)"
+    normalise_playlist "$playlist"
 }
 
 # Playlist of the destination-format tracks. By default that is everything
@@ -454,6 +598,7 @@ analyse_levels() {
 plan_for() {
     local source_file="$1"
     probe_source "$source_file"
+    infer_tags "$source_file"
 
     PLAN_ACTION="" PLAN_REASON="" DEST_EXT="" PLAN_RATE="" PLAN_BITS=""
 
@@ -735,6 +880,10 @@ convert_file() {
     # Levels are measured but never altered - a gain change cannot be undone
     # bit-exactly, so the figures are recorded and left for the player to use
     local level_tags=()
+    # Players show artist and title from the tags, so fill in what the
+    # filename tells us rather than shipping a blank display
+    [[ -z "$INFER_ARTIST" ]] || level_tags+=(-metadata "artist=$INFER_ARTIST")
+    [[ -z "$INFER_TITLE" ]] || level_tags+=(-metadata "title=$INFER_TITLE")
     if [[ "$PEAK_METADATA" == true ]]; then
         analyse_levels "$source_file"
         [[ -z "$PEAK_DBFS" ]] || level_tags+=(-metadata "PEAK_DBFS=$PEAK_DBFS")
@@ -804,6 +953,56 @@ convert_file() {
 # duration are dropped, over-spec lossless files are re-encoded in place, and
 # lossy files that are not mp3 are re-encoded to mp3. Nothing is deleted -
 # files taken out of the library are moved aside so the change is reversible.
+# Does this file already carry measured levels?
+has_level_tags() {
+    ffprobe -v quiet -show_entries format_tags=PEAK_DBFS \
+        -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | grep -q .
+}
+
+# Top up whatever tags a file is missing, in one remux. -c copy passes the
+# audio through untouched, so this costs nothing in quality even on an mp3.
+top_up_tags() {
+    local file="$1" ext scratch id3=() extra=()
+    ext="${file##*.}"
+    scratch="${file%.*}.tags-tmp.$ext"
+    [[ "$ext" != "aiff" ]] || id3=(-write_id3v2 1 -id3v2_version 3)
+
+    # infer_tags was run by plan_for and only reports what is absent
+    [[ -z "$INFER_ARTIST" ]] || extra+=(-metadata "artist=$INFER_ARTIST")
+    [[ -z "$INFER_TITLE" ]] || extra+=(-metadata "title=$INFER_TITLE")
+
+    if [[ "$PEAK_METADATA" == true ]] && ! has_level_tags "$file"; then
+        analyse_levels "$file"
+        if [[ -n "$PEAK_DBFS" ]]; then
+            extra+=(-metadata "PEAK_DBFS=$PEAK_DBFS")
+            extra+=(-metadata "LOUDNESS_LUFS=$LOUDNESS_LUFS")
+        fi
+    fi
+
+    [[ ${#extra[@]} -gt 0 ]] || return 1
+
+    if ffmpeg -nostdin -v error -i "$file" -map 0 -c copy -map_metadata 0 \
+        ${id3[@]+"${id3[@]}"} ${extra[@]+"${extra[@]}"} \
+        "$scratch" 2>/dev/null; then
+        mv "$scratch" "$file"
+        return 0
+    fi
+    rm -f "$scratch"
+    return 1
+}
+
+# The path today's rules would give this file, relative to the playlist
+cleanup_desired_rel() {
+    local abs="$1" playlist_dir="$2" ext="$3" rel
+    if [[ "$ORG_BY_ALBUM_ARTIST" == true ]]; then
+        # require_title: without a real title tag the file keeps its place
+        rel=$(org_relpath_for "$abs" true)
+        if [[ -n "$rel" ]]; then echo "$rel.$ext"; return; fi
+    fi
+    # Otherwise keep the layout but apply current name simplification
+    simplify_path "$(relpath "$abs" "$playlist_dir")"
+}
+
 run_cleanup() {
     local playlist="$1"
     local playlist_dir
@@ -857,8 +1056,12 @@ run_cleanup() {
             echo "  ~ re-encoding to ${PLAN_RATE}Hz${PLAN_BITS:+/${PLAN_BITS}bit} $DEST_EXT: $entry"
             if convert_file "$abs" "$scratch" >/dev/null 2>&1; then
                 mv "$scratch" "$newabs"
-                [[ "$newabs" == "$abs" ]] || mv "$abs" "$aside/$entry" 2>/dev/null || true
-                entry=$(relpath "$newabs" "$playlist_dir")
+                if [[ "$newabs" != "$abs" ]]; then
+                    mkdir -p "$aside/$(dirname "$entry")"
+                    mv "$abs" "$aside/$entry" 2>/dev/null || true
+                fi
+                abs="$newabs"
+                entry=$(relpath "$abs" "$playlist_dir")
                 CLEANUP_FIXED=$((CLEANUP_FIXED + 1))
             else
                 rm -f "$scratch"
@@ -866,7 +1069,36 @@ run_cleanup() {
                 CONVERSION_ERRORS=$((CONVERSION_ERRORS + 1))
             fi
         fi
+        local dest_ext="$DEST_EXT"
         PLAN_ACTION=""
+
+        # Backfill anything the file is missing: artist and title read off
+        # the filename so the players have something to show, plus the level
+        # figures if they were never measured. One remux, audio untouched.
+        if top_up_tags "$abs"; then
+            echo "  + tags added: $entry"
+            CLEANUP_TAGGED=$((CLEANUP_TAGGED + 1))
+            # the title is now a real tag, so re-read before deciding on a move
+            infer_tags "$abs"
+        fi
+
+        # Where would this file be placed by today's naming rules? Anything
+        # laid down under older rules gets migrated to the current layout.
+        local desired target
+        desired=$(cleanup_desired_rel "$abs" "$playlist_dir" "$dest_ext")
+        if [[ -n "$desired" && "$desired" != "$entry" ]]; then
+            target="$playlist_dir/$desired"
+            if [[ -e "$target" ]] && ! [[ "$target" -ef "$abs" ]]; then
+                echo "  ! wanted $desired but something is already there, left: $entry"
+            else
+                mkdir -p "$(dirname "$target")"
+                mv "$abs" "$target"
+                echo "  > moved to current layout: $entry -> $desired"
+                abs="$target"
+                entry="$desired"
+                CLEANUP_MOVED=$((CLEANUP_MOVED + 1))
+            fi
+        fi
 
         [[ -z "$pending" ]] || { printf '%s' "$pending" >> "$tmp"; pending=""; }
         printf '%s\n' "$entry" >> "$tmp"
@@ -875,7 +1107,8 @@ run_cleanup() {
 
     cat "$tmp" > "$playlist"
     rm -f "$tmp"
-    echo "Cleanup: $CLEANUP_FIXED re-encoded, $CLEANUP_DROPPED dropped"
+    normalise_playlist "$playlist"
+    echo "Cleanup: $CLEANUP_FIXED re-encoded, $CLEANUP_TAGGED tagged, $CLEANUP_MOVED moved, $CLEANUP_DROPPED dropped"
     [[ $CLEANUP_DROPPED -eq 0 ]] || echo "Cleanup: files moved aside to $aside"
 }
 
@@ -1018,6 +1251,12 @@ else
         echo "Error: M3U playlist '$SOURCE_M3U' not found!"
         exit 1
     fi
+    if [[ "$(basename "$SOURCE_M3U")" == "$PLAYLIST_NAME" ]]; then
+        echo "Error: '$PLAYLIST_NAME' is this tool's own destination playlist."
+        echo "       Reading and rewriting the same file would overwrite it."
+        echo "       Rename it to something else and run again."
+        exit 1
+    fi
     echo "Source M3U: $SOURCE_M3U"
 fi
 
@@ -1048,21 +1287,6 @@ CONVERTED_OUTPUT=""
 PLAYLIST_REFUSED=0
 trap 'rm -f "$MANIFEST" "$CLAIMS"' EXIT
 
-# Cleanup pointed straight at a playlist is a standalone job: review that
-# playlist against current settings and stop, without a conversion pass.
-if [[ "$CLEANUP" == true && -n "$SOURCE_M3U" ]]; then
-    CLEANUP_FIXED=0
-    CLEANUP_DROPPED=0
-    CONVERSION_ERRORS=0
-    PLAN_ACTION=""
-    MANIFEST=$(mktemp)
-    CLAIMS=$(mktemp)
-    CONVERTED_OUTPUT=""
-    trap 'rm -f "$MANIFEST" "$CLAIMS"' EXIT
-    run_cleanup "$SOURCE_M3U"
-    exit 0
-fi
-
 # Setup deleted directory if clear-src is enabled
 if [[ "$CLEAR_SRC" == true ]]; then
     DELETED_BASE="/tmp/deleted/$DATE_SUFFIX"
@@ -1078,6 +1302,8 @@ CLEAR_SKIPPED=0
 SKIPPED_COUNT=0
 CLEANUP_FIXED=0
 CLEANUP_DROPPED=0
+CLEANUP_TAGGED=0
+CLEANUP_MOVED=0
 PLAN_ACTION=""
 
 # find expression matching every extension worth examining
@@ -1121,13 +1347,11 @@ if [[ -n "$SOURCE_DIR" ]]; then
 
     # Playlist of every destination-format track, at the root of wherever the
     # converted files landed (the output prefix dir, else the source dir).
-    DIR_NAME=$(simplify_path "$(basename "$(abspath "$SOURCE_DIR")")")
-    [[ -n "$DIR_NAME" ]] || DIR_NAME="tracks"
     if [[ -n "$OUTPUT_PREFIX_DIR" ]]; then
-        DEST_PLAYLIST="$OUTPUT_PREFIX_DIR/$DIR_NAME.$PLAYLIST_LABEL.m3u"
+        DEST_PLAYLIST="$OUTPUT_PREFIX_DIR/$PLAYLIST_NAME"
         write_dir_playlist "$DEST_PLAYLIST" "$OUTPUT_PREFIX_DIR"
     else
-        DEST_PLAYLIST="$SOURCE_DIR/$DIR_NAME.$PLAYLIST_LABEL.m3u"
+        DEST_PLAYLIST="$SOURCE_DIR/$PLAYLIST_NAME"
         write_dir_playlist "$DEST_PLAYLIST" "$SOURCE_DIR"
     fi
     [[ "$CLEANUP" != true ]] || run_cleanup "$DEST_PLAYLIST"
@@ -1141,18 +1365,10 @@ else
     #   --output-prefix-dir   <prefix-dir>/<name>.<format>.<ext>
     #   otherwise             alongside the source M3U as <name>.<format>.<ext>
     M3U_NAME=$(basename "$SOURCE_M3U")
-    M3U_EXT="${M3U_NAME##*.}"
-    [[ "$M3U_NAME" == *.* ]] || M3U_EXT="m3u"
-    if [[ "$CLEAR_SRC" == true ]]; then
-        # Overwrites the original, so its name has to stay exactly as it is
-        NEW_M3U="$SOURCE_M3U"
+    if [[ -n "$OUTPUT_PREFIX_DIR" ]]; then
+        NEW_M3U="$OUTPUT_PREFIX_DIR/$PLAYLIST_NAME"
     else
-        NEW_M3U_NAME="$(simplify_path "${M3U_NAME%.*}").$PLAYLIST_LABEL.$M3U_EXT"
-        if [[ -n "$OUTPUT_PREFIX_DIR" ]]; then
-            NEW_M3U="$OUTPUT_PREFIX_DIR/$NEW_M3U_NAME"
-        else
-            NEW_M3U="$M3U_DIR/$NEW_M3U_NAME"
-        fi
+        NEW_M3U="$M3U_DIR/$PLAYLIST_NAME"
     fi
     NEW_M3U_DIR=$(dirname "$NEW_M3U")
     NEW_M3U_TMP=$(mktemp)
@@ -1253,16 +1469,20 @@ else
     flush_pending
 
     # Write the playlist for the converted files
-    if [[ "$NEW_M3U" == "$SOURCE_M3U" ]]; then
-        # --clear-src: the source playlist is rewritten in place. Its new
-        # contents are a transformation of its old ones, so every entry is
-        # already accounted for; the original is kept alongside the sources.
+    if [[ "$CLEAR_SRC" == true ]]; then
+        # The source playlist now points at files that have been moved away,
+        # so keep a copy of it beside them
         cp -p "$SOURCE_M3U" "$DELETED_BASE/$M3U_NAME"
-        echo "Original playlist copied to: $DELETED_BASE/$M3U_NAME"
-        cat "$NEW_M3U_TMP" > "$NEW_M3U"
-        echo "Playlist updated in place: $NEW_M3U"
+        echo "Source playlist copied to: $DELETED_BASE/$M3U_NAME"
+    fi
+    m3u_rc=0
+    m3u_summary=$(python3 -c "$MERGE_PY" "$NEW_M3U" m3u "$NEW_M3U_TMP") || m3u_rc=$?
+    if [[ $m3u_rc -ne 0 ]]; then
+        echo "✗ Playlist left untouched: $NEW_M3U"
+        PLAYLIST_REFUSED=1
     else
-        echo "Playlist: $NEW_M3U ($(python3 -c "$MERGE_PY" "$NEW_M3U" m3u "$NEW_M3U_TMP"))"
+        echo "Playlist: $NEW_M3U ($m3u_summary)"
+        normalise_playlist "$NEW_M3U"
     fi
     rm -f "$NEW_M3U_TMP"
     [[ "$CLEANUP" != true ]] || run_cleanup "$NEW_M3U"

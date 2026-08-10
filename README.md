@@ -54,15 +54,25 @@ mp3 is never re-encoded. Levels are measured into `PEAK_DBFS` and
 exactly. Tracks under three minutes are skipped.
 
 Output is organised from each track's own tags as
-`{Band}/{Album}/{Artist} - {Title}`, and a `<name>.cdj.m3u` playlist is written
-alongside it. Re-running adds to that playlist rather than replacing it.
+`{Band}/{Album}/{Artist} - {Title}`, and a single `playlist.cdj.m3u` is written
+at the root of the destination. The name is always the same, so every run keeps
+building the same list; re-running adds to it rather than replacing it. Entries
+are ordered by path and each track appears once, so the same library always
+produces the same playlist. That file is refused as a source, so it cannot be
+overwritten while being read.
 
-To re-check a library you already built — dropping tracks whose files have
-moved away or that are too short, and re-encoding anything above spec:
+Add `--cleanup` to any normal run to also migrate what is already in the
+destination, so a library built by an older version catches up with the
+current rules:
 
 ```bash
-./track_format_converter --source-m3u ~/dj/music/library.cdj.m3u --output-prefix-dir "" --cleanup
+./track_format_converter --source-dir ~/Downloads --output-prefix-dir ~/dj/music --cleanup
 ```
+
+It drops entries whose files have gone or that are too short, re-encodes
+anything above spec, measures level tags that were never recorded, and moves
+files sitting at out-of-date paths into the current layout. Nothing is
+deleted — anything removed goes to `/tmp/deleted/<timestamp>/cleanup`.
 
 Requires `ffmpeg`, `ffprobe` and `python3`.
 
